@@ -1,0 +1,188 @@
+Next-Generation Breast Cancer Classification Using Mass Spectrometry Proteomics:
+# 1. File upload and data processing
+from google.colab import files
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler, RobustScaler
+import io
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Upload files
+print("Uploading files...")
+uploaded = files.upload()
+
+# Check uploaded files
+print("\nUploaded files:")
+for filename, content in uploaded.items():
+    size = len(content) if isinstance(content, (bytes, bytearray)) else len(content.encode())
+    print(f"- {filename} ({size} bytes)")
+
+def find_uploaded_file(pattern):
+    matches = [name for name in uploaded.keys() if pattern in name]
+    if not matches:
+        raise FileNotFoundError(f"No file matching '{pattern}' found in uploaded files")
+    return matches[0]
+
+clinical_filename = find_uploaded_file('clinical_data_breast_cancer')
+proteomes_filename = find_uploaded_file('77_cancer_proteomes_CPTAC_itraq')
+pam50_filename = find_uploaded_file('PAM50_proteins')
+
+# Load data
+clinical = pd.read_csv(io.BytesIO(uploaded[clinical_filename]))
+proteomes = pd.read_csv(io.BytesIO(uploaded[proteomes_filename]))
+pam50 = pd.read_csv(io.BytesIO(uploaded[pam50_filename]))
+
+print("\nData loaded successfully!")
+print(f"Clinical data shape: {clinical.shape}")
+print(f"Proteomes data shape: {proteomes.shape}")
+print(f"PAM50 data shape: {pam50.shape}")
+
+# Data processing
+sample_ids = proteomes.columns[3:]
+normalized_ids = [f"TCGA-{id.split('.')[0]}" if '.' in id else f"TCGA-{id}" for id in sample_ids]
+proteome_data = proteomes.set_index('RefSeq_accession_number').iloc[:, 2:].T
+proteome_data.index = normalized_ids
+merged = clinical.merge(proteome_data, left_on='Complete TCGA ID', right_index=True, how='inner')
+
+# Feature engineering
+X = merged.filter(regex='^NP_|^XP_|^YP_')
+print(f"\nMissing values before imputation: {X.isna().sum().sum()}")
+X = X.apply(lambda x: x.fillna(x.median()), axis=0)
+print(f"Missing values after imputation: {X.isna().sum().sum()}")
+
+# Enhanced preprocessing
+scaler = RobustScaler()
+X_scaled = scaler.fit_transform(X)
+y = (merged['ER Status'] == 'Positive').astype(int)
+
+# 2. Enhanced Model Training & Evaluation
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from xgboost import XGBClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import cross_val_predict, StratifiedKFold
+from sklearn.metrics import precision_recall_curve, auc, classification_report
+from sklearn.feature_selection import SelectKBest, f_classif
+
+# Select top 50 most important features
+selector = SelectKBest(f_classif, k=50)
+X_selected = selector.fit_transform(X_scaled, y)
+
+# Enhanced model configurations
+models = {
+    "XGBoost": XGBClassifier(
+        eval_metric='logloss',
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_alpha=0.1,
+        reg_lambda=0.1
+    ),
+    "Random Forest": RandomForestClassifier(
+        n_estimators=300,
+        max_depth=12,
+        min_samples_split=3,
+        min_samples_leaf=2,
+        class_weight='balanced',
+        max_features='sqrt'
+    ),
+    "Gradient Boosting": GradientBoostingClassifier(
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=5,
+        min_samples_split=5,
+        min_samples_leaf=2
+    ),
+    "MLP": MLPClassifier(
+        hidden_layer_sizes=(150, 75, 30),
+        max_iter=1000,
+        early_stopping=True,
+        learning_rate='adaptive',
+        alpha=0.001,
+        batch_size=32
+    )
+}
+
+print("\nEvaluating enhanced models...")
+results = []
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+for name, model in models.items():
+    print(f"\nEvaluating {name}...")
+    y_pred = cross_val_predict(model, X_selected, y, cv=cv, method='predict_proba')[:,1]
+    precision, recall, _ = precision_recall_curve(y, y_pred)
+    pr_auc = auc(recall, precision)
+    
+    y_pred_class = (y_pred > 0.5).astype(int)
+    report = classification_report(y, y_pred_class, output_dict=True)
+    
+    results.append({
+        'Model': name,
+        'PR-AUC': pr_auc,
+        'Accuracy': report['accuracy'],
+        'Precision_0': report['0']['precision'],
+        'Recall_0': report['0']['recall'],
+        'F1_0': report['0']['f1-score'],
+        'Precision_1': report['1']['precision'],
+        'Recall_1': report['1']['recall'],
+        'F1_1': report['1']['f1-score']
+    })
+    
+    print(classification_report(y, y_pred_class))
+
+# 3. Visualization of Results
+results_df = pd.DataFrame(results)
+
+# Plot metrics
+plt.figure(figsize=(15, 8))
+metrics = ['Accuracy', 'Precision_0', 'Recall_0', 'F1_0', 'Precision_1', 'Recall_1', 'F1_1']
+for i, metric in enumerate(metrics, 1):
+    plt.subplot(2, 4, i)
+    sns.barplot(data=results_df, x='Model', y=metric)
+    plt.title(metric.replace('_', ' '))
+    plt.xticks(rotation=45)
+    plt.ylim(0.8, 1.0)  # Set y-axis to show range from 80% to 100%
+plt.tight_layout()
+plt.show()
+
+# 4. Feature Importance Analysis
+rf = RandomForestClassifier(n_estimators=300, max_depth=12).fit(X_selected, y)
+importances = pd.DataFrame({
+    'Protein': merged.filter(regex='^NP_|^XP_|^YP_').columns[selector.get_support()],
+    'Importance': rf.feature_importances_
+}).sort_values('Importance', ascending=False)
+
+plt.figure(figsize=(10,12))
+sns.barplot(data=importances.head(20), x='Importance', y='Protein')
+plt.title('Top 20 Important Proteins')
+plt.tight_layout()
+plt.show()
+
+# 5. UpSet Plot (same as before)
+from upsetplot import from_memberships, UpSet
+
+top_10 = importances.head(10)['Protein'].values
+binary_data = {
+    protein: (X_scaled[:, np.where(merged.filter(regex='^NP_|^XP_|^YP_').columns == protein)[0][0]] > 0).astype(int)
+    for protein in top_10
+}
+
+binary_df = pd.DataFrame(binary_data)
+binary_df.index = merged['Complete TCGA ID']
+
+memberships = []
+for _, row in binary_df.iterrows():
+    membership = tuple(protein for protein, val in row.items() if val)
+    memberships.append(membership)
+
+print("\nGenerating UpSet plot...")
+plt.figure(figsize=(12, 8))
+upset_data = from_memberships(memberships)
+UpSet(upset_data, subset_size='count', show_counts=True).plot()
+plt.suptitle('Co-occurrence of Top Protein Expressions', y=1.02)
+plt.tight_layout()
+plt.show()
+
+print("\nEnhanced analysis complete")
